@@ -1,4 +1,3 @@
-const axios = require('axios');
 const core = require('@actions/core');
 const { request, gql, GraphQLClient } = require('graphql-request')
 
@@ -9,12 +8,15 @@ const SRC_ENVIRONMENT_NAME = core.getInput('SRC_ENVIRONMENT_NAME');
 const SRC_ENVIRONMENT_ID = core.getInput('SRC_ENVIRONMENT_ID');
 const DEST_ENV_NAME = core.getInput('DEST_ENV_NAME');
 const ENV_VARS = core.getInput('ENV_VARS');
-const PROVIDER = core.getInput('PROVIDER');
+const API_SERVICE_NAME = core.getInput('API_SERVICE_NAME');
+const IGNORE_SERVICE_REDEPLOY = core.getInput('IGNORE_SERVICE_REDEPLOY');
 const ENDPOINT = 'https://backboard.railway.app/graphql/v2';
 
 // Github Required Inputs
-const BRANCH_NAME = core.getInput('branch_name');
-const REPOSITORY = core.getInput('repository');
+const BRANCH_NAME = core.getInput('branch_name') || "feat-railway-7";
+
+// Optional Inputs
+const DEPLOYMENT_MAX_TIMEOUT = core.getInput('MAX_TIMEOUT');
 
 async function railwayGraphQLRequest(query, variables) {
     const client = new GraphQLClient(ENDPOINT, {
@@ -29,7 +31,51 @@ async function railwayGraphQLRequest(query, variables) {
     }
 }
 
-async function getEnvironmentId() {
+async function getProject() {
+    let query =
+        `query project($id: String!) {
+            project(id: $id) {
+                name
+                services {
+                    edges {
+                        node {
+                            id
+                            name
+                        }
+                    }
+                }
+                environments {
+                    edges {
+                        node {
+                            id
+                            name
+                            serviceInstances {
+                                edges {
+                                    node {
+                                        serviceId
+                                        startCommand
+                                        domains {
+                                            serviceDomains {
+                                                domain
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }`
+
+    const variables = {
+        "id": PROJECT_ID,
+    }
+
+    return await railwayGraphQLRequest(query, variables)
+}
+
+async function getEnvironments() {
     let query =
         `query environments($projectId: String!) {
             environments(projectId: $projectId) {
@@ -37,9 +83,18 @@ async function getEnvironmentId() {
                     node {
                         id
                         name
+                        deployments {
+                            edges {
+                                node {
+                                    id
+                                    status
+                                }
+                            }
+                        }
                         serviceInstances {
                             edges {
                                 node {
+                                    id
                                     domains {
                                         serviceDomains {
                                             domain
@@ -63,23 +118,35 @@ async function getEnvironmentId() {
 }
 
 async function createEnvironment(sourceEnvironmentId) {
+    console.log("Creating Environment... based on source environment ID:", sourceEnvironmentId)
     try {
         let query = gql`
         mutation environmentCreate($input: EnvironmentCreateInput!) {
             environmentCreate(input: $input) {
                 id
+                name
                 createdAt
+                deploymentTriggers {
+                    edges {
+                        node {
+                            id
+                            environmentId
+                            branch
+                            projectId
+                        }
+                    }
+                }
                 serviceInstances {
                     edges {
                         node {
                             id
-                            serviceId
                             domains {
                                 serviceDomains {
                                     domain
                                     id
                                 }
                             }
+                            serviceId
                         }
                     }
                 }
@@ -124,25 +191,21 @@ async function updateEnvironment(environmentId, serviceId, variables) {
     }
 }
 
-async function deployService(environmentId, serviceId) {
+async function deploymentTriggerUpdate(deploymentTriggerId) {
+    console.log("Updating Deploying Trigger to new Branch Name")
     try {
         let query = gql`
-        mutation deploymentTriggerCreate($input: DeploymentTriggerCreateInput!) {
-            deploymentTriggerCreate(input: $input) {
+        mutation deploymentTriggerUpdate($id: String!, $input: DeploymentTriggerUpdateInput!) {
+            deploymentTriggerUpdate(id: $id, input: $input) {
                 id
-                branch
             }
         }
         `
 
         let variables = {
+            id: deploymentTriggerId,
             input: {
                 "branch": BRANCH_NAME,
-                "environmentId": environmentId,
-                "projectId": PROJECT_ID,
-                "provider": PROVIDER,
-                "repository": REPOSITORY,
-                "serviceId": serviceId
             }
         }
 
@@ -152,22 +215,20 @@ async function deployService(environmentId, serviceId) {
     }
 }
 
-async function checkIfEnvironmentExists() {
-    let response = await getEnvironmentId();
-    const filteredEdges = response.environments.edges.filter((edge) => edge.node.name === DEST_ENV_NAME);
-    return filteredEdges.length == 1 ? { environmentId: filteredEdges[0].node.id, serviceId: filteredEdges[0].serviceInstances.edges[0].serviceId } : null;
-}
-
-async function deleteEnvironment(environmentId) {
+async function serviceInstanceRedeploy(environmentId, serviceId) {
+    console.log("Redeploying Service...")
+    console.log("Environment ID:", environmentId)
+    console.log("Service ID:", serviceId)
     try {
         let query = gql`
-        mutation environmentDelete($id: String!) {
-            environmentDelete(id: $id)
+        mutation serviceInstanceRedeploy($environmentId: String!, $serviceId: String!) {
+            serviceInstanceRedeploy(environmentId: $environmentId, serviceId: $serviceId)
         }
         `
 
         let variables = {
             "environmentId": environmentId,
+            "serviceId": serviceId
         }
 
         return await railwayGraphQLRequest(query, variables)
@@ -176,42 +237,143 @@ async function deleteEnvironment(environmentId) {
     }
 }
 
+async function updateAllDeploymentTriggers(deploymentTriggerIds) {
+    try {
+        // Create an array of promises
+        const updatePromises = deploymentTriggerIds.map(deploymentTriggerId =>
+            deploymentTriggerUpdate(deploymentTriggerId)
+        );
+
+        // Await all promises
+        await Promise.all(updatePromises);
+        console.log("All deployment triggers updated successfully.");
+    } catch (error) {
+        console.error("An error occurred during the update:", error);
+    }
+}
+
+async function updateEnvironmentVariablesForServices(environmentId, serviceInstances, ENV_VARS) {
+    const serviceIds = [];
+
+    // Extract service IDs
+    for (const serviceInstance of serviceInstances.edges) {
+        const { serviceId } = serviceInstance.node;
+        serviceIds.push(serviceId);
+    }
+
+    try {
+        // Create an array of promises for updating environment variables
+        const updatePromises = serviceIds.map(serviceId =>
+            updateEnvironment(environmentId, serviceId, ENV_VARS)
+        );
+
+        // Await all promises to complete
+        await Promise.all(updatePromises);
+        console.log("Environment variables updated for all services.");
+    } catch (error) {
+        console.error("An error occurred during the update:", error);
+    }
+}
+
+async function redeployAllServices(environmentId, servicesToRedeploy) {
+    try {
+        // Create an array of promises for redeployments
+        const redeployPromises = servicesToRedeploy.map(serviceId =>
+            serviceInstanceRedeploy(environmentId, serviceId)
+        );
+
+        // Await all promises to complete
+        await Promise.all(redeployPromises);
+        console.log("All services redeployed successfully.");
+    } catch (error) {
+        console.error("An error occurred during redeployment:", error);
+    }
+}
+
+async function getService(serviceId) {
+    let query =
+        `query environments($id: String!) {
+            service(id: $id) {
+                name
+                }
+        }`
+
+    const variables = {
+        "id": serviceId,
+    }
+
+    return await railwayGraphQLRequest(query, variables)
+}
+
 async function run() {
     try {
-        // Check if Environment already exists
-        const environmentIfExists = await checkIfEnvironmentExists();
-        if (environmentIfExists) {
-            console.log('Environment already exists')
-            const { environmentId, serviceId } = environmentIfExists;
+        // Get Environments to check if the environment already exists
+        let response = await getEnvironments();
 
-            console.log('Deploying Service');
-            await deployService(environmentId, serviceId);
-        } else {
-            console.log('Environment does not exist')
-            let srcEnvironmentId = SRC_ENVIRONMENT_ID;
+        // Filter the response to only include the environment name we are looking to create
+        const filteredEdges = response.environments.edges.filter((edge) => edge.node.name === DEST_ENV_NAME);
 
-            // Get Source Environment ID to base new PR environment from
-            if (!SRC_ENVIRONMENT_ID) {
-                let response = await getEnvironmentId();
-                srcEnvironmentId = response.environments.edges.filter((edge) => edge.node.name === SRC_ENVIRONMENT_NAME)[0].node.id;
+        // If there is a match this means the environment already exists
+        if (filteredEdges.length == 1) {
+            throw new Error('Environment already exists. Please delete the environment via API or Railway Dashboard and try again.')
+        }
+
+        let srcEnvironmentId = SRC_ENVIRONMENT_ID;
+
+        // If no source ENV_ID provided get Source Environment ID to base new PR environment from (aka use the same environment variables)
+        if (!SRC_ENVIRONMENT_ID) {
+            srcEnvironmentId = response.environments.edges.filter((edge) => edge.node.name === SRC_ENVIRONMENT_NAME)[0].node.id;
+        }
+
+        // Create the new Environment based on the Source Environment
+        const createdEnvironment = await createEnvironment(srcEnvironmentId);
+        console.log("Created Environment:")
+        console.dir(createdEnvironment, { depth: null })
+
+        const { id: environmentId } = createdEnvironment.environmentCreate;
+
+        // Get all the Deployment Triggers
+        const deploymentTriggerIds = [];
+        for (const deploymentTrigger of createdEnvironment.environmentCreate.deploymentTriggers.edges) {
+            const { id: deploymentTriggerId } = deploymentTrigger.node;
+            deploymentTriggerIds.push(deploymentTriggerId);
+        }
+
+        // Get all the Service Instances
+        const { serviceInstances } = createdEnvironment.environmentCreate;
+
+        // Update the Environment Variables on each Service Instance
+        await updateEnvironmentVariablesForServices(environmentId, serviceInstances, ENV_VARS);
+
+        // Wait for the created environment to finish initializing
+        console.log("Waiting 15 seconds for deployment to initialize and become available")
+        await new Promise(resolve => setTimeout(resolve, 15000)); // Wait for 15 seconds
+
+        // Set the Deployment Trigger Branch for Each Service 
+        await updateAllDeploymentTriggers(deploymentTriggerIds);
+
+        const servicesToIgnore = JSON.parse(IGNORE_SERVICE_REDEPLOY)
+        const servicesToRedeploy = [];
+
+        // Get the names for each deployed service
+        for (const serviceInstance of createdEnvironment.environmentCreate.serviceInstances.edges) {
+            const { domains } = serviceInstance.node;
+            const { service } = await getService(serviceInstance.node.serviceId);
+            const { name } = service;
+
+            if (!servicesToIgnore.includes(name)) {
+                servicesToRedeploy.push(serviceInstance.node.serviceId);
             }
 
-            // Create the new Environment based on the Source Environment
-            const createdEnvironment = await createEnvironment(srcEnvironmentId);
-            console.dir(createdEnvironment, { depth: null })
-
-            const { id: environmentId } = createdEnvironment.environmentCreate;
-            const { serviceId } = createdEnvironment.environmentCreate.serviceInstances.edges[0].node;
-
-            // Update the Environment Variables
-            const updatedEnvironmentVariables = await updateEnvironment(environmentId, serviceId, ENV_VARS);
-
-            // Deploy the Service
-            await deployService(environmentId, serviceId);
-
-            const { domain } = createdEnvironment.environmentCreate.serviceInstances.edges[0].node.domains.serviceDomains[0];
-            core.setOutput('service_domain', domain);
+            if ((API_SERVICE_NAME && name === API_SERVICE_NAME) || name === 'app' || name === 'backend' || name === 'web') {
+                const { domain } = domains.serviceDomains?.[0];
+                console.log('Domain:', domain)
+                core.setOutput('service_domain', domain);
+            }
         }
+
+        // Redeploy the Services
+        await redeployAllServices(environmentId, servicesToRedeploy);
     } catch (error) {
         console.error('Error in API calls:', error);
         // Handle the error, e.g., fail the action
